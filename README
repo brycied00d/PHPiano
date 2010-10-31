@@ -1,1 +1,9 @@
-A PHP-port of libpiano from pianobar.
+A re-implementation of libpiano (from http://github.com/PromyLOPh/pianobar) in PHP.
+Idea to re-implement in my language of choice is courtesy of pithos (http://kevinmehall.net/p/pithos/)
+
+PHP class to facilitate interactions with the Pandora streaming Internet radio service.
+So far, very basic functionality
+ * Login
+ * Retrieve station list
+
+Cheers!
