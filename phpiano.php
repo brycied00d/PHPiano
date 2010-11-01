@@ -63,6 +63,9 @@ class PHPiano
 	private $routeId;
 	private $listenerId;
 	private $authToken;
+	private $webauthToken;
+	private $timeOffset;
+	private $userInfo;	// Copy of the user info we get when we authenticate
 	
 	// Disable logging by default
 	var $loglevel = 0;
@@ -72,16 +75,18 @@ class PHPiano
 			'verbosity'=>'no_white_space', 
 			'escaping'=>array('non-ascii', 'non-print', 'markup'),
 			'version'=>'xmlrpc',
-			'encoding'=>'utf8');
+			'encoding'=>'UTF-8');
 	
 	// Our cURL handle
 	private $ch;
 	
-	// Our Blowfish handle
-	private $blowfish;
+	// Our Blowfish handles
+	private $blowfish_encrypt;
+	private $blowfish_decrypt;
 	
 	// Our blowfish keys
 	private $keys;
+	
 	
 	function __construct($user=null, $pass=null)
 	{
@@ -108,9 +113,14 @@ class PHPiano
 		// Grab our blowfish keys
 		$this->keys = new Pandora_Keys();
 		
+		define('CRYPT_BLOWFISH_NOMCRYPT', 1);	// Use the PHP-based routines, since they can accept p/s-boxes
 		require_once('Crypt/Blowfish.php');
-		$this->blowfish_enc = new Crypt_Blowfish(null);
-		$this->blowfish_dec = new Crypt_Blowfish($this->keys->in_key_p);
+		$this->blowfish_encrypt = new Crypt_Blowfish("Harold");	// Bogus key
+		$this->blowfish_encrypt->_crypt->_P = $this->keys->out_key_p;	// Set our own p/s-boxes
+		$this->blowfish_encrypt->_crypt->_S = $this->keys->out_key_s;
+		$this->blowfish_decrypt = new Crypt_Blowfish("Kumar");	// Bogus key
+		$this->blowfish_decrypt->_crypt->_P = $this->keys->in_key_p;	// Set our own p/s-boxes
+		$this->blowfish_decrypt->_crypt->_S = $this->keys->in_key_s;
 	}
 	
 	// Simple accessor methods
@@ -161,24 +171,46 @@ class PHPiano
 		}
 		
 		// Sanity check, we can encrypt/decrypt. misc.sync
-		$xmlrpc = $this->xmlrpc_call('misc.sync');
+		$cryptedTimestamp = $this->xmlrpc_call('misc.sync');
+		if(is_null($cryptedTimestamp))
+			throw new PHP_Error("Couldn't establish communication with Pandora.");
+		if(($decryptedTimestamp=$this->pandora_decrypt($cryptedTimestamp)) !== false)
+		{
+			preg_match('/\d{'.strlen(time()).',}/', $decryptedTimestamp, $match);
+			$decryptedTimestamp=$match[0];
+			$this->timeOffset=time()-$decryptedTimestamp;
+		}
 		
 		// Perform the actual authentication
-		$xmlrpc = $this->xmlrpc_call('listener.authenticateListener', array($this->username, $this->password));
+		$userInfo = $this->xmlrpc_call('listener.authenticateListener', array($this->username, $this->password));
+		$this->userInfo=$userInfo;
+		if(isset($userInfo['listenerId']))
+			$this->listenerId=$userInfo['listenerId'];
+		if(isset($userInfo['authToken']))
+			$this->authToken=$userInfo['authToken'];
+		if(isset($userInfo['webAuthToken']))
+			$this->webAuthToken=$userInfo['webAuthToken'];
 		
-		// XXX Do something more ;)
-		
+		// We're connected!
 	}
 	
+	function get_stations()
+	{
+		if(is_null($this->listenerId))
+			throw new PHPiano_Error("Not connected to Pandora");
+		$stations=$this->xmlrpc_call('station.getStations');
+		var_dump($stations);
+	}
 	
 	// The internal "guts" methods
 	private function xmlrpc_call($method, $args=array(), $url_args=true)
 	{
 		if($url_args)
 			$url_args=$args;
-		array_unshift($args, time());
 		if($this->authToken)
 			array_unshift($args, $this->authToken);
+		if($method != "misc.sync")
+			array_unshift($args, time());
 		
 		$this->log("Making XMLRPC call '$method' with ".sizeof($args)." args: ".print_r($args, true));
 		$xmlrpc = xmlrpc_encode_request($method, $args, $this->xmlrpc_format_options);
@@ -198,9 +230,9 @@ class PHPiano
 		
 		$response = $this->curl_post($xmlrpc_url, $xmlrpc_enc);
 		$this->log("Response received: $response");
-		$response=xmlrpc_decode($response);
+		$response=xmlrpc_decode_request($response, $this->xmlrpc_format_options['encoding']);
 		$this->log("Decoded response: ".print_r($response, true));
-		if(xmlrpc_is_fault($response))
+		if(is_array($response) && xmlrpc_is_fault($response))
 		{
 			throw new PHPiano_Error("Protocol error!\n{$response['faultCode']}: {$response['faultString']}");
 		}
@@ -219,7 +251,7 @@ class PHPiano
 			);
 		curl_setopt($this->ch, CURLOPT_HTTPHEADER, $headers);
 		curl_setopt($this->ch, CURLOPT_POSTFIELDS, $data);
-		$response = curl_exec($this->ch);	//XXX
+		$response = curl_exec($this->ch);
 		return $response;
 	}
 	
@@ -227,17 +259,10 @@ class PHPiano
 	private function pandora_encrypt($text)
 	{
 		$this->log("Encrypting ".strlen($text)." bytes into Blowfish data.");
-		
-		$res = $this->blowfish_enc->setKey(hex2bin($this->keys->out_key_p));
-		if (PEAR::isError($res))
-			throw new PHPiano_Error('Error with key: '.$res->getMessage());
-		
-		$encrypted = $this->blowfish_enc->encrypt($text);
+		$encrypted = $this->blowfish_encrypt->encrypt($text);
 		if (PEAR::isError($encrypted))
 			throw new PHPiano_Error('Error while encrypting: '.$encrypted->getMessage());
-		
 		$encrypted = bin2hex($encrypted);
-		
 		$this->log("Returning ".strlen($encrypted)." bytes of Blowfish data.");
 		return $encrypted;
 	}
@@ -246,17 +271,10 @@ class PHPiano
 	private function pandora_decrypt($text)
 	{
 		$this->log("Decrypting ".strlen($text)." bytes of Blowfish data.");
-		
-		$res = $this->blowfish_dec->setKey(hex2bin($this->keys->in_key_p));
-		if (PEAR::isError($res))
-			throw new PHPiano_Error('Error with key: '.$res->getMessage());
-		
-		$decrypted = $this->blowfish_enc->decrypt($text);
+		$decrypted = $this->blowfish_decrypt->decrypt(hex2bin($text));
 		if (PEAR::isError($decrypted))
 			throw new PHPiano_Error('Error while encrypting: '.$decrypted->getMessage());
-		
-		$decrypted = bin2hex($decrypted);
-		
+		//$decrypted = bin2hex($decrypted);
 		$this->log("Returning ".strlen($decrypted)." bytes of decrypted data.");
 		return $decrypted;
 	}
